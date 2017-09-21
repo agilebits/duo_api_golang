@@ -286,7 +286,7 @@ func (duoapi *DuoApi) SignedCallWithDefaultTimeout(method string,
 		request.Header.Set("Content-type", "application/x-www-form-urlencoded")
 	}
 
-	resp, err := duoapi.authClient.Do(request)
+	resp, err := duoapi.apiClient.Do(request)
 	var body []byte
 	if err == nil {
 		body, err = ioutil.ReadAll(resp.Body)
