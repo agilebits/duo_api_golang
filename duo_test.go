@@ -1,9 +1,15 @@
 package duoapi
 
 import (
+	"bytes"
+	"errors"
+	"io/ioutil"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCanonicalize(t *testing.T) {
@@ -18,7 +24,7 @@ func TestCanonicalize(t *testing.T) {
 		"5")
 	params := strings.Split(params_str, "\n")
 	if len(params) != 5 {
-		t.Error("Expected 5 parameters, but got " + string(len(params)))
+		t.Error("Expected 5 parameters, but got " + strconv.Itoa(len(params)))
 	}
 	if params[1] != string("POST") {
 		t.Error("Expected POST, but got " + params[1])
@@ -153,4 +159,187 @@ func TestNewDuo(t *testing.T) {
 	if duo == nil {
 		t.Fatal("Failed to create a new Duo Api")
 	}
+}
+
+func TestSetTransport(t *testing.T) {
+	transportOpt := func(tr *http.Transport) {
+		tr.MaxResponseHeaderBytes = 12345
+	}
+
+	duo := NewDuoApi("ABC", "123", "api-XXXXXXX.duosecurity.com", "go-client", SetTransport(transportOpt))
+
+	httpClient := duo.apiClient.(*http.Client)
+	transport := httpClient.Transport.(*http.Transport)
+	if transport.MaxResponseHeaderBytes != 12345 {
+		t.Fatal("SetTransport failed to update Duo HTTP client transport configuration")
+	}
+}
+
+func TestDupApiCallHttpErr(t *testing.T) {
+	httpClient := &mockHttpClient{doError: true}
+	sleepSvc := &mockSleepService{}
+
+	duo := &DuoApi{
+		ikey:       "ikey-foo",
+		skey:       "skey-bar",
+		host:       "host.baz",
+		userAgent:  "ua-qux",
+		apiClient:  httpClient,
+		authClient: httpClient,
+		sleepSvc:   sleepSvc,
+	}
+	resp, body, err := duo.Call("GET", "/v9/hello/world", url.Values{})
+	if resp != nil {
+		t.Fatal("Non nil response returned")
+	}
+	if len(body) != 0 {
+		t.Fatal("Non empty body returned")
+	}
+	if err == nil {
+		t.Fatal("No error returned")
+	}
+	if len(httpClient.actualRequests) != 1 {
+		t.Fatal("We should not retry after an HTTP error")
+	}
+}
+
+func getMockClients(httpResponses []http.Response) (*DuoApi, *mockHttpClient, *mockSleepService) {
+	httpClient := &mockHttpClient{responses: httpResponses}
+	sleepSvc := &mockSleepService{}
+
+	return &DuoApi{
+		ikey:       "ikey-foo",
+		skey:       "skey-bar",
+		host:       "host.baz",
+		userAgent:  "ua-qux",
+		apiClient:  httpClient,
+		authClient: httpClient,
+		sleepSvc:   sleepSvc,
+	}, httpClient, sleepSvc
+}
+
+var okResp = http.Response{
+	StatusCode: 200,
+	Body:       ioutil.NopCloser(bytes.NewReader([]byte("hello world"))),
+}
+var rateLimitResp = http.Response{
+	StatusCode: 429,
+	Body:       ioutil.NopCloser(bytes.NewReader([]byte("hello world"))),
+}
+
+var completeRateLimitSleepDurations = []time.Duration{
+	time.Millisecond * 1000,
+	time.Millisecond * 2000,
+	time.Millisecond * 4000,
+	time.Millisecond * 8000,
+	time.Millisecond * 16000,
+	time.Millisecond * 32000,
+}
+
+func assertRateLimitedCall(
+	t *testing.T,
+	actualResponse http.Response,
+	httpClient mockHttpClient,
+	sleepSvc mockSleepService,
+	expectedTotalCalls int,
+	expectedResponse http.Response,
+	expectedSleepDurations []time.Duration) {
+
+	if actualResponse.StatusCode != expectedResponse.StatusCode {
+		t.Fatal("returned response does not have correct status code")
+	}
+	if actualResponse.Body != expectedResponse.Body {
+		t.Fatal("returned response does not have correct body")
+	}
+
+	retriedRequestCount := expectedTotalCalls - 1
+
+	if len(httpClient.actualRequests) != expectedTotalCalls {
+		t.Fatal("Made " + strconv.Itoa(len(httpClient.actualRequests)) +
+			" requests instead of " + strconv.Itoa(expectedTotalCalls))
+	}
+
+	if len(sleepSvc.sleepCalls) != retriedRequestCount {
+		t.Fatal("Made " + strconv.Itoa(len(sleepSvc.sleepCalls)) +
+			" sleep calls instead of " + strconv.Itoa(retriedRequestCount))
+	}
+	for i := range expectedSleepDurations {
+		if sleepSvc.sleepCalls[i] != expectedSleepDurations[i] {
+			t.Fatal("Slept for " + sleepSvc.sleepCalls[i].String() +
+				" instead of " + expectedSleepDurations[i].String())
+		}
+	}
+}
+
+func TestCallRateLimitedOnce(t *testing.T) {
+	responses := []http.Response{rateLimitResp, okResp}
+	sleepDurations := []time.Duration{time.Millisecond * 1000}
+
+	duo, mockHttp, mockSleep := getMockClients(responses)
+	resp, _, _ := duo.Call("GET", "/v9/hello/world", url.Values{})
+	assertRateLimitedCall(t, *resp, *mockHttp, *mockSleep, 2, okResp, sleepDurations)
+}
+
+func TestCallCompletelyRateLimited(t *testing.T) {
+	responses := make([]http.Response, 7)
+	for i := range responses {
+		responses[i] = rateLimitResp
+	}
+
+	duo, mockHttp, mockSleep := getMockClients(responses)
+	resp, _, _ := duo.Call("GET", "/v9/hello/world", url.Values{})
+	assertRateLimitedCall(t, *resp, *mockHttp, *mockSleep,
+		7, rateLimitResp, completeRateLimitSleepDurations)
+}
+
+func TestSignedCallRateLimitedOnce(t *testing.T) {
+	responses := []http.Response{rateLimitResp, okResp}
+	sleepDurations := []time.Duration{time.Millisecond * 1000}
+
+	duo, mockHttp, mockSleep := getMockClients(responses)
+	resp, _, _ := duo.SignedCall("GET", "/v9/hello/world", url.Values{})
+	assertRateLimitedCall(t, *resp, *mockHttp, *mockSleep, 2, okResp, sleepDurations)
+}
+
+func TestSignedCallCompletelyRateLimited(t *testing.T) {
+	responses := make([]http.Response, 7)
+	for i := range responses {
+		responses[i] = rateLimitResp
+	}
+
+	duo, mockHttp, mockSleep := getMockClients(responses)
+	resp, _, _ := duo.SignedCall("GET", "/v9/hello/world", url.Values{})
+	assertRateLimitedCall(t, *resp, *mockHttp, *mockSleep,
+		7, rateLimitResp, completeRateLimitSleepDurations)
+}
+
+type mockHttpClient struct {
+	responses      []http.Response
+	actualRequests []*http.Request
+	doError        bool
+}
+
+func (c *mockHttpClient) Do(req *http.Request) (*http.Response, error) {
+	if c.actualRequests == nil {
+		c.actualRequests = []*http.Request{}
+	}
+	c.actualRequests = append(c.actualRequests, req)
+	if c.doError {
+		return nil, errors.New("Ouch")
+	}
+
+	resp := c.responses[0]
+	c.responses = c.responses[1:]
+	return &resp, nil
+}
+
+type mockSleepService struct {
+	sleepCalls []time.Duration
+}
+
+func (svc *mockSleepService) Sleep(duration time.Duration) {
+	if svc.sleepCalls == nil {
+		svc.sleepCalls = []time.Duration{}
+	}
+	svc.sleepCalls = append(svc.sleepCalls, duration)
 }
